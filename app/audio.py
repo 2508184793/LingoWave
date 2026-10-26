@@ -82,12 +82,17 @@ class Utterance:
     start: float
     end: float
     created: float
+    id: int = 0
+    revision: int = 0
+    final: bool = True
+    started_at: float = 0.0
+    ended_at: float = 0.0
 
 
 class Segmenter:
     """Bounded, non-overlapping speech segments with pre-roll and silence endpointing."""
 
-    def __init__(self, detector, max_seconds=4.0, silence_ms=550, gain=True):
+    def __init__(self, detector, max_seconds=4.0, silence_ms=550, gain=True, preview_seconds=0):
         self.detector = detector
         self.max_frames = max(1, int(max_seconds * RATE / FRAME))
         self.silence_frames = max(1, math.ceil(silence_ms / 32))
@@ -99,9 +104,14 @@ class Segmenter:
         self.start = 0
         self.quiet = 0
         self.speech_count = 0
+        self.preview_frames = math.ceil(preview_seconds * RATE / FRAME) if preview_seconds else 0
+        self.next_preview = self.preview_frames
+        self.utterance_id = 0
+        self.started_at = self.ended_at = 0.0
 
     def feed(self, audio: np.ndarray) -> list[Utterance]:
         self.pending = np.concatenate((self.pending, audio))
+        feed_end = time.monotonic()
         completed = []
         while len(self.pending) >= FRAME:
             frame = self.pending[:FRAME].copy()
@@ -109,7 +119,10 @@ class Segmenter:
             speech = self.detector(normalize(frame) if self.gain else frame)
             if not self.active:
                 if speech:
+                    self.utterance_id += 1
                     self.start = self.position - len(self.pre) * FRAME
+                    frame_end = feed_end - len(self.pending) / RATE
+                    self.started_at = frame_end - (len(self.pre) + 1) * FRAME / RATE
                     self.active = list(self.pre)
                     self.pre.clear()
                 else:
@@ -119,20 +132,29 @@ class Segmenter:
                 self.speech_count += int(speech)
                 self.quiet = 0 if speech else self.quiet + 1
             self.position += FRAME
+            self.ended_at = feed_end - len(self.pending) / RATE - self.quiet * FRAME / RATE
             if self.active and (len(self.active) >= self.max_frames or self.quiet >= self.silence_frames):
                 segment = self.flush()
                 if segment is not None:
                     completed.append(segment)
+            elif self.active and self.preview_frames and len(self.active) >= self.next_preview and self.speech_count >= 6:
+                completed.append(self.snapshot(final=False))
+                self.next_preview = len(self.active) + self.preview_frames
         return completed
+
+    def snapshot(self, final=True) -> Utterance:
+        audio = np.concatenate(self.active)
+        return Utterance(normalize(audio) if self.gain else audio, self.start / RATE, self.position / RATE,
+                         time.monotonic(), self.utterance_id, self.position, final, self.started_at, self.ended_at)
 
     def flush(self) -> Utterance | None:
         result = None
         if self.active and self.speech_count >= 3:
-            audio = np.concatenate(self.active)
-            result = Utterance(normalize(audio) if self.gain else audio, self.start / RATE, self.position / RATE, time.monotonic())
+            result = self.snapshot()
         self.active = []
         self.quiet = self.speech_count = 0
         self.pre.clear()
+        self.next_preview = self.preview_frames
         return result
 
 
@@ -148,13 +170,18 @@ class LoopbackCapture:
     def run(self):
         import pyaudiowpatch as pa
 
-        blocks: queue.Queue = queue.Queue(maxsize=30)
+        blocks: queue.Queue = queue.Queue(maxsize=5)
 
         def callback(data, frame_count, timing, status):
             try:
                 blocks.put_nowait(data)
             except queue.Full:
                 self.dropped += 1
+                try:
+                    blocks.get_nowait()
+                    blocks.put_nowait(data)
+                except (queue.Empty, queue.Full):
+                    pass
             return (None, pa.paComplete if self.stop.is_set() else pa.paContinue)
 
         try:

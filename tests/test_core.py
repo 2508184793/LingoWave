@@ -74,7 +74,7 @@ class ProviderTests(unittest.TestCase):
     def setUp(self):
         MockService.requests.clear()
         MockService.mode = "sse"
-        self.s = Settings(base_url=self.url, model="test")
+        self.s = Settings(provider="qwen-mt", base_url=self.url, model="test")
 
     def test_qwen_special_payload_and_stream(self):
         partial = []

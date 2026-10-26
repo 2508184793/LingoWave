@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 import threading
 import time
 import uuid
@@ -8,18 +7,19 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, Qt, QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFrame,
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QProgressBar, QPushButton, QFileDialog, QScrollArea, QVBoxLayout, QWidget, QLayout)
 
-from .audio import default_device, devices
-from .config import DATA_DIR, LANGUAGES, ROOT, Settings, get_secret
+from .audio import devices
+from .config import DATA_DIR, LANGUAGES, Settings, get_secret
 from .engine import Engine
 from .history import Caption, History, export_captions
 from .hotkeys import GlobalHotkeys
 from .overlay import SubtitleOverlay
-from .providers import Translator
+from .providers import Cancelled, Translator
+from .download_dialog import ModelDownloadDialog
 from .settings_dialog import SettingsDialog
 
 
@@ -136,14 +136,14 @@ class MainWindow(QMainWindow):
         active.setStyleSheet("background:#1c352d;color:#a6e6ca;border-radius:8px;padding:12px 4px;")
         nav.addWidget(active)
         nav.addWidget(button("模型与字幕", self.open_settings, "quiet"))
-        nav.addWidget(button("下载识别模型", self.download_model, "quiet"))
+        nav.addWidget(button("下载模型", self.download_model, "quiet"))
         nav.addStretch()
         nav.addWidget(label("LOCAL + CLOUD", "eyebrow"))
         tagline = label("声音留在当下\n语言不再设限", "muted")
         tagline.setStyleSheet("color:#728996;line-height:1.5;")
         nav.addWidget(tagline)
         nav.addSpacing(14)
-        nav.addWidget(label("DESKTOP  /  v0.1", "muted"))
+        nav.addWidget(label("DESKTOP  /  v0.2", "muted"))
         root.addWidget(rail)
 
         area = QWidget()
@@ -265,8 +265,8 @@ class MainWindow(QMainWindow):
         self.translation_summary = label("")
         self.translation_summary.setWordWrap(True)
         model_box.addWidget(self.translation_summary)
-        self.settings_button = button("配置模型与 API Key", self.open_settings, "quiet")
-        self.test_button = button("测试翻译连接", self.test_translation, "quiet")
+        self.settings_button = button("配置翻译模型", self.open_settings, "quiet")
+        self.test_button = button("测试翻译", self.test_translation, "quiet")
         model_box.addWidget(self.settings_button)
         model_box.addWidget(self.test_button)
         right.addWidget(model_card)
@@ -294,7 +294,7 @@ class MainWindow(QMainWindow):
         right_scroll.setWidget(right_widget)
         columns.addWidget(right_scroll)
         page.addLayout(columns, 1)
-        self.message = label("本地识别只在本机处理音频。云端翻译仅发送识别文字。", "muted")
+        self.message = label("选择本地识别与内嵌翻译后，无需第三方软件或 API Key。", "muted")
         self.message.setWordWrap(True)
         page.addWidget(self.message)
         root.addWidget(area, 1)
@@ -320,7 +320,8 @@ class MainWindow(QMainWindow):
     def refresh_summary(self):
         asr = {"faster-whisper": f"Whisper {self.s.whisper_model} · {self.s.whisper_device.upper()}", "qwen": f"Qwen3-ASR · {self.s.whisper_device.upper()}", "api": f"转写 API · {self.s.asr_model}"}
         self.asr_summary.setText(asr.get(self.s.asr_engine, "Whisper"))
-        self.translation_summary.setText("仅显示原文" if self.s.provider == "none" else self.s.model)
+        self.translation_summary.setText("仅显示原文" if self.s.provider == "none" else
+                                         f"内嵌 · {Path(self.s.local_model_path).stem}" if self.s.provider == "embedded" else self.s.model)
 
     def save_inputs(self):
         self.s.device_name = self.device_combo.currentData() or ""
@@ -329,8 +330,8 @@ class MainWindow(QMainWindow):
             self.s.save()
 
     def open_settings(self):
-        if self.engine is not None:
-            self.notify("请先停止监听，再修改模型和字幕设置。")
+        if self.engine is not None or (hasattr(self, "_test_thread") and self._test_thread.is_alive()):
+            self.notify("请先停止监听或等待翻译测试结束，再修改模型和字幕设置。")
             return
         self.save_inputs()
         dialog = SettingsDialog(self.s, self)
@@ -343,12 +344,17 @@ class MainWindow(QMainWindow):
             elif not self.s.remember_history and self.history:
                 self.history.close()
                 self.history = None
-            self.notify("设置已保存。API Key 存放在 Windows 凭据管理器。")
+            self.notify("设置已保存。" + ("内嵌翻译会随监听启动、停止，不需要其他软件。" if self.s.provider == "embedded" else "API Key 存放在 Windows 凭据管理器。"))
 
     def keys(self):
-        return get_secret(self.s.provider, self.s.base_url), get_secret("asr", self.s.asr_url)
+        key = "" if self.s.provider in ("embedded", "none") else get_secret(self.s.provider, self.s.base_url)
+        asr_key = get_secret("asr", self.s.asr_url) if self.s.asr_engine == "api" else ""
+        return key, asr_key
 
     def toggle_listening(self):
+        if hasattr(self, "_test_thread") and self._test_thread.is_alive():
+            self.notify("请等待翻译测试结束后再开始监听。")
+            return
         if self.engine:
             self.engine.stop()
             self.start_button.setEnabled(False)
@@ -363,6 +369,9 @@ class MainWindow(QMainWindow):
             self.start_session(probe=True)
 
     def start_session(self, probe=False):
+        if hasattr(self, "_test_thread") and self._test_thread.is_alive():
+            self.notify("请等待翻译测试释放模型后再开始。")
+            return
         self.demo_timer.stop()
         self.save_inputs()
         try:
@@ -408,7 +417,7 @@ class MainWindow(QMainWindow):
         self.set_running(False)
         self.meter.setValue(0)
         self.level_label.setText("— dBFS")
-        self.statusBar().showMessage("已停止 · 可调整配置后重新开始")
+        self.statusBar().showMessage("已停止 · 模型资源已释放，可重新开始")
         engine.deleteLater()
         if self.closing:
             self.close()
@@ -553,7 +562,7 @@ class MainWindow(QMainWindow):
         self._test_signals = signals
         self.test_button.setEnabled(False)
         self.start_button.setEnabled(False)
-        self.notify("正在测试翻译连接，发送示例文字 Hello, world.…")
+        self.notify("正在测试翻译 · Hello, world.…")
         signals.status.connect(self.notify)
         signals.error.connect(lambda text: self.notify(text, True))
 
@@ -561,17 +570,25 @@ class MainWindow(QMainWindow):
             self.test_button.setEnabled(True)
             self.start_button.setEnabled(True)
             signals.deleteLater()
+            if self.closing:
+                QTimer.singleShot(50, self.close)
 
         signals.finished.connect(done)
 
         def run():
             try:
+                translator.prepare(signals.stop_event, signals.status.emit)
                 text = translator.translate("Hello, world.", [], signals.stop_event)
-                signals.status.emit(f"连接成功 · {text}")
+                signals.status.emit(f"翻译成功 · {text}")
+            except Cancelled:
+                pass
             except Exception as exc:
                 signals.error.emit(str(exc))
             finally:
-                signals.finished.emit()
+                try:
+                    translator.close()
+                finally:
+                    signals.finished.emit()
 
         self._test_thread = threading.Thread(target=run, daemon=True)
         self._test_thread.start()
@@ -580,57 +597,10 @@ class MainWindow(QMainWindow):
         if self.engine:
             self.notify("请先停止监听，再下载模型。")
             return
-        dialog = QDialog(self)
-        dialog.setWindowTitle("准备本地 Whisper 模型")
-        dialog.resize(540, 340)
-        layout = QVBoxLayout(dialog)
-        info = label("下载权重后即可离线识别。small 约 0.5GB；下载在后台进行，关闭此窗口不会中断。")
-        info.setWordWrap(True)
-        layout.addWidget(info)
-        choice = QComboBox()
-        choice.addItems(["tiny", "base", "small", "medium", "large-v3"])
-        choice.setCurrentText(self.s.whisper_model)
-        source = QComboBox()
-        source.addItem("Hugging Face · 原始仓库", "huggingface")
-        source.addItem("ModelScope · 社区转换仓库", "modelscope")
-        layout.addWidget(choice)
-        layout.addWidget(source)
-        log = label("等待开始…", "muted")
-        log.setWordWrap(True)
-        layout.addWidget(log, 1)
-        start = QPushButton("下载模型")
-        layout.addWidget(start)
-
-        def download():
-            if hasattr(self, "download_process") and self.download_process.state() != QProcess.ProcessState.NotRunning:
-                log.setText("已有下载任务正在进行，请稍后再试。")
-                return
-            process = QProcess(self)
-            self.download_process = process
-            process.setWorkingDirectory(str(ROOT))
-            process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-            process.setProgram(sys.executable)
-            process.setArguments(["-u", "-m", "app.download", "--model", choice.currentText(), "--source", source.currentData()])
-            buffer = [""]
-
-            def read():
-                buffer[0] = (buffer[0] + bytes(process.readAllStandardOutput()).decode("utf-8", "replace"))[-4000:]
-                self.statusBar().showMessage(buffer[0].splitlines()[-1] if buffer[0].splitlines() else "下载中…")
-                if dialog.isVisible():
-                    log.setText("\n".join(buffer[0].splitlines()[-7:]))
-
-            def finish(code, _):
-                self.notify("模型下载完成，可以开始监听。" if code == 0 else "模型下载失败，可切换下载源或查看终端日志。", code != 0)
-                if dialog.isVisible():
-                    start.setEnabled(True)
-
-            process.readyReadStandardOutput.connect(read)
-            process.finished.connect(finish)
-            process.start()
-            start.setEnabled(False)
-
-        start.clicked.connect(download)
+        dialog = ModelDownloadDialog(self.s.whisper_model, "translation" if self.s.provider == "embedded" else "whisper", self)
         dialog.exec()
+        if dialog.completed:
+            self.notify("本地模型已准备好，可以开始监听。")
 
     def closeEvent(self, event):
         if self.engine:
@@ -640,13 +610,11 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if hasattr(self, "_test_thread") and self._test_thread.is_alive():
+            self.closing = True
             self._test_signals.stop_event.set()
             self.notify("正在结束翻译连接测试，请稍候再关闭。")
             event.ignore()
             return
-        if hasattr(self, "download_process") and self.download_process.state() != QProcess.ProcessState.NotRunning:
-            self.download_process.terminate()
-            self.download_process.waitForFinished(1000)
         self.demo_timer.stop()
         self.overlay.close()
         self.save_inputs()

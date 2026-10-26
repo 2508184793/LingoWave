@@ -51,10 +51,22 @@ class Translator:
     def __init__(self, settings: Settings, key: str = ""):
         self.s = settings
         self.key = key
-        if settings.provider != "none":
+        self.local = None
+        if settings.provider == "embedded":
+            from .local_translation import EmbeddedTranslator
+            self.local = EmbeddedTranslator(settings)
+        elif settings.provider != "none":
             endpoint(settings.base_url, "/chat/completions")
         if settings.provider == "qwen-mt" and not key:
             raise ValueError("请先在翻译设置中填写并保存 Qwen-MT 的 API Key。")
+
+    def prepare(self, stop: threading.Event, status=lambda _: None):
+        if self.local:
+            self.local.prepare(stop, status)
+
+    def close(self):
+        if self.local:
+            self.local.close()
 
     def translate(self, text: str, context: list[tuple[str, str]], stop: threading.Event, on_partial=None) -> str:
         s = self.s
@@ -62,6 +74,8 @@ class Translator:
             raise Cancelled()
         if s.provider == "none":
             return ""
+        if self.local:
+            return self.local.translate(text, stop, on_partial, context)
         source = LANGUAGES[s.source][1]
         target = LANGUAGES[s.target][1]
         payload = {"model": s.model, "stream": True}
@@ -148,7 +162,7 @@ class WhisperRecognizer:
             self._dll_dirs = []
             import site
             for site_path in site.getsitepackages():
-                for name in ("cublas", "cudnn", "cuda_runtime"):
+                for name in ("cublas", "cudnn", "cuda_runtime", "cuda_nvrtc"):
                     path = Path(site_path) / "nvidia" / name / "bin"
                     if path.is_dir() and hasattr(os, "add_dll_directory"):
                         self._dll_dirs.append(os.add_dll_directory(str(path)))
@@ -157,13 +171,28 @@ class WhisperRecognizer:
                                   compute_type="int8_float16" if settings.whisper_device == "cuda" else "int8",
                                   cpu_threads=8, num_workers=1, download_root=str(ROOT / "models" / "hub"))
         self.language = None if settings.source == "自动检测" else LANGUAGES[settings.source][0]
+        self.context = ""
+        self.final = True
+
+    def set_context(self, context: str, final=True):
+        self.context = context[-300:]
+        self.final = final
 
     def transcribe(self, audio: np.ndarray) -> str:
-        segments, _ = self.model.transcribe(audio, language=self.language, beam_size=1,
+        segments, _ = self.model.transcribe(audio, language=self.language, beam_size=3 if self.final else 1,
+                                           initial_prompt=self.context or None,
                                            condition_on_previous_text=False, vad_filter=True,
                                            vad_parameters={"min_silence_duration_ms": 200},
                                            no_speech_threshold=0.6)
         return "".join(s.text for s in segments).strip()
+
+    def close(self):
+        model, self.model = self.model, None
+        if model is not None:
+            model.model.unload_model()
+        for directory in getattr(self, "_dll_dirs", []):
+            directory.close()
+        self._dll_dirs = []
 
 
 class QwenRecognizer:
@@ -185,6 +214,14 @@ class QwenRecognizer:
     def transcribe(self, audio: np.ndarray) -> str:
         results = self.model.transcribe(audio=(audio, 16000), language=self.language)
         return results[0].text.strip() if results else ""
+
+    def close(self):
+        import gc
+        import torch
+        self.model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 class APIRecognizer:

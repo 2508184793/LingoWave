@@ -16,17 +16,33 @@ from app.engine import Engine
 
 
 class FakeRecognizer:
+    instances = []
+
     def __init__(self, *_):
         self.count = 0
+        self.closed = False
+        self.instances.append(self)
 
     def transcribe(self, audio):
         self.count += 1
         return f"Sentence {self.count}"
 
+    def close(self):
+        self.closed = True
+
 
 class FakeTranslator:
+    instances = []
+
     def __init__(self, *_):
+        self.closed = False
+        self.instances.append(self)
+
+    def prepare(self, *_):
         pass
+
+    def close(self):
+        self.closed = True
 
     def translate(self, source, context, stop, partial):
         result = "译文 " + source
@@ -79,6 +95,26 @@ class EngineTests(unittest.TestCase):
         self.assertEqual([c.id for c in complete], [1, 2, 3])
         self.assertEqual([c.translation for c in complete], ["译文 Sentence 1", "译文 Sentence 2", "译文 Sentence 3"])
         self.assertFalse(engine.thread.is_alive())
+        self.assertTrue(FakeTranslator.instances[-1].closed)
+        self.assertTrue(FakeRecognizer.instances[-1].closed)
+
+    def test_load_failure_releases_both_models(self):
+        errors, finished = [], []
+
+        class FailingTranslator(FakeTranslator):
+            def prepare(self, *_):
+                raise RuntimeError("translation load failed")
+
+        with patch("app.engine.WhisperRecognizer", FakeRecognizer), patch("app.engine.Translator", FailingTranslator):
+            engine = Engine(Settings())
+            engine.error.connect(errors.append)
+            engine.finished.connect(lambda: finished.append(True))
+            engine.start()
+            self.pump(lambda: bool(finished))
+            engine.thread.join(1)
+        self.assertEqual(errors, ["translation load failed"])
+        self.assertTrue(FakeRecognizer.instances[-1].closed)
+        self.assertTrue(FakeTranslator.instances[-1].closed)
 
     def test_loading_can_be_stopped_before_capture(self):
         release = threading.Event()

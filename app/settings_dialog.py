@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
                                QFormLayout, QGroupBox, QLabel, QLineEdit, QMessageBox,
-                               QScrollArea, QSpinBox, QVBoxLayout, QWidget)
+                               QScrollArea, QSpinBox, QVBoxLayout, QWidget, QHBoxLayout,
+                               QPushButton, QFileDialog)
 
 from .config import Settings, get_secret, put_secret
 from .providers import endpoint
+from .download_dialog import ModelDownloadDialog
+from .download import WHISPER_MODELS
 
 
 class SettingsDialog(QDialog):
@@ -40,7 +44,7 @@ class SettingsDialog(QDialog):
         form.addRow("识别引擎", self.asr)
         self.whisper = QComboBox()
         self.whisper.setEditable(True)
-        self.whisper.addItems(["tiny", "base", "small", "medium", "large-v3"])
+        self.whisper.addItems(WHISPER_MODELS)
         self.whisper.setCurrentText(settings.whisper_model)
         form.addRow("Whisper 模型 / 路径", self.whisper)
         self.device = QComboBox()
@@ -65,8 +69,9 @@ class SettingsDialog(QDialog):
 
         translation = QGroupBox("02  翻译模型")
         tf = QFormLayout(translation)
+        self.translation_form = tf
         self.provider = QComboBox()
-        for label, value in [("Qwen-MT · 翻译专用 API", "qwen-mt"), ("通用兼容 API · 云端 / 本地", "compatible"), ("Ollama · 本地模型", "ollama"), ("仅原文 · 不调用翻译", "none")]:
+        for label, value in [("内嵌本地模型 · 无需第三方软件", "embedded"), ("Qwen-MT · 翻译专用 API", "qwen-mt"), ("通用兼容 API · 云端 / 本地", "compatible"), ("Ollama · 本地模型（可选）", "ollama"), ("仅原文 · 不调用翻译", "none")]:
             self.provider.addItem(label, value)
         self.provider.setCurrentIndex(max(0, self.provider.findData(settings.provider)))
         self.url = QLineEdit(settings.base_url)
@@ -77,6 +82,29 @@ class SettingsDialog(QDialog):
         tf.addRow("服务地址", self.url)
         tf.addRow("模型名称", self.model)
         tf.addRow("API Key", self.key)
+        self.local_options = QWidget()
+        local_form = QFormLayout(self.local_options)
+        local_form.setContentsMargins(0, 0, 0, 0)
+        self.local_path = QLineEdit(settings.local_model_path)
+        path_row = QHBoxLayout()
+        path_row.addWidget(self.local_path, 1)
+        browse = QPushButton("选择文件")
+        browse.clicked.connect(self.browse_local)
+        path_row.addWidget(browse)
+        local_form.addRow("本地模型", path_row)
+        download = QPushButton("下载推荐翻译模型 · 约 1.1GB")
+        download.clicked.connect(self.download_local)
+        local_form.addRow(download)
+        self.local_device = QComboBox()
+        for name, value in [("自动 · 优先使用可用 GPU", "auto"), ("CPU · 无需 GPU 运行库", "cpu"), ("GPU · 需要支持 GPU 的内嵌组件", "gpu")]:
+            self.local_device.addItem(name, value)
+        self.local_device.setCurrentIndex(max(0, self.local_device.findData(settings.local_device)))
+        local_form.addRow("翻译推理设备", self.local_device)
+        self.local_threads = QSpinBox()
+        self.local_threads.setRange(1, 32)
+        self.local_threads.setValue(settings.local_threads)
+        local_form.addRow("翻译 CPU 线程", self.local_threads)
+        tf.addRow(self.local_options)
         self.provider_hint = QLabel()
         self.provider_hint.setWordWrap(True)
         self.provider_hint.setObjectName("muted")
@@ -141,17 +169,24 @@ class SettingsDialog(QDialog):
         self.provider.currentIndexChanged.connect(self.preset)
         self.url.editingFinished.connect(self.load_key)
         self.asr_url.editingFinished.connect(self.load_asr_key)
+        self.asr.currentIndexChanged.connect(self.load_asr_key)
         self.load_key()
         self.load_asr_key()
         self.update_hint()
 
     def load_key(self):
+        if self.provider.currentData() in ("embedded", "none"):
+            self.key.clear()
+            return
         try:
             self.key.setText(get_secret(self.provider.currentData(), self.url.text()))
         except Exception:
             self.key.clear()
 
     def load_asr_key(self):
+        if self.asr.currentData() != "api":
+            self.asr_key.clear()
+            return
         try:
             self.asr_key.setText(get_secret("asr", self.asr_url.text()))
         except Exception:
@@ -170,16 +205,34 @@ class SettingsDialog(QDialog):
         self.load_key()
         self.update_hint()
 
+    def browse_local(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择本地翻译模型", self.local_path.text(), "GGUF 模型 (*.gguf)")
+        if path:
+            self.local_path.setText(path)
+
+    def download_local(self):
+        from .config import DEFAULT_LOCAL_MODEL
+        dialog = ModelDownloadDialog(kind="translation", parent=self)
+        dialog.exec()
+        if dialog.completed and dialog.kind.currentData() == "translation":
+            self.local_path.setText(DEFAULT_LOCAL_MODEL)
+
     def update_hint(self):
         provider = self.provider.currentData()
         self.provider_hint.setText({
+            "embedded": "直接在软件内运行，停止监听后卸载模型。无需 Ollama、服务地址或 API Key。默认组件为 CPU 版；首次下载后可离线使用。",
             "qwen-mt": "默认地址为阿里云中国内地服务。其他区域请填写对应地址与 API Key。",
             "compatible": "填写以 /v1 结尾的服务根地址。实时字幕建议在服务端关闭深度思考。",
             "ollama": "先启动 Ollama 并下载模型。软件使用本地 /api/chat，关闭思考模式。",
             "none": "只显示语音识别原文，不产生翻译 API 费用。",
         }[provider])
+        self.local_options.setVisible(provider == "embedded")
+        remote = provider not in ("embedded", "none")
         for widget in (self.url, self.model, self.key):
-            widget.setEnabled(provider != "none")
+            widget.setEnabled(remote)
+            self.translation_form.setRowVisible(widget, remote)
+        self.privacy.setText("选择本地语音识别时，音频和文字均留在本机；模型准备好后不需要联网。"
+                             if provider == "embedded" else "API Key 保存在 Windows 凭据管理器。云端翻译发送识别文字；云端识别发送音频。")
 
     def save(self):
         try:
@@ -188,7 +241,12 @@ class SettingsDialog(QDialog):
             s.whisper_device, s.qwen_path = self.device.currentData(), self.qwen.text().strip()
             s.asr_url, s.asr_model = self.asr_url.text().strip(), self.asr_model.text().strip()
             s.provider, s.base_url, s.model = self.provider.currentData(), self.url.text().strip(), self.model.text().strip()
-            if s.provider != "none":
+            s.local_model_path = self.local_path.text().strip()
+            s.local_device, s.local_threads = self.local_device.currentData(), self.local_threads.value()
+            if s.provider == "embedded":
+                if not s.local_model_path or Path(s.local_model_path).suffix.lower() != ".gguf":
+                    raise ValueError("请选择 .gguf 本地翻译模型，或保留推荐下载路径。")
+            elif s.provider != "none":
                 endpoint(s.base_url, "/chat/completions")
                 if not s.model:
                     raise ValueError("请填写翻译模型名称。")
@@ -200,8 +258,10 @@ class SettingsDialog(QDialog):
             s.font_size, s.opacity = self.font_size.value(), self.opacity.value()
             s.overlay_width, s.subtitle_seconds = self.width.value(), self.timeout.value()
             s.show_source, s.auto_gain, s.remember_history = self.source.isChecked(), self.gain.isChecked(), self.history.isChecked()
-            put_secret(s.provider, s.base_url, self.key.text().strip())
-            put_secret("asr", s.asr_url, self.asr_key.text().strip())
+            if s.provider not in ("embedded", "none"):
+                put_secret(s.provider, s.base_url, self.key.text().strip())
+            if s.asr_engine == "api":
+                put_secret("asr", s.asr_url, self.asr_key.text().strip())
             s.save()
             self.result_settings = s
             self.accept()

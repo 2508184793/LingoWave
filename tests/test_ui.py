@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest.mock import patch
 from dataclasses import replace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -63,6 +64,20 @@ class UITests(unittest.TestCase):
         dialog.provider.setCurrentIndex(dialog.provider.findData("none"))
         self.assertFalse(dialog.url.isEnabled())
         dialog.close()
+
+    def test_embedded_settings_hide_service_fields(self):
+        dialog = SettingsDialog(self.window.s, self.window)
+        dialog.provider.setCurrentIndex(dialog.provider.findData("embedded"))
+        self.assertTrue(dialog.url.isHidden())
+        self.assertTrue(dialog.key.isHidden())
+        self.assertFalse(dialog.local_options.isHidden())
+        self.assertIn("无需 Ollama", dialog.provider_hint.text())
+        dialog.close()
+
+    def test_offline_mode_does_not_read_api_keys(self):
+        self.window.s.provider = "embedded"
+        with patch("app.window.get_secret", side_effect=AssertionError("No credentials needed")):
+            self.assertEqual(self.window.keys(), ("", ""))
 
 
 if __name__ == "__main__":

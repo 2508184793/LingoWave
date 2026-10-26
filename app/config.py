@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+LOCAL_MODEL_NAME = "Hy-MT2-1.8B-Q4_K_M.gguf"
+DEFAULT_LOCAL_MODEL = f"models/translation/{LOCAL_MODEL_NAME}"
 DATA_DIR = Path(os.environ.get("LOCALAPPDATA", str(ROOT / "data"))) / "LingoWave"
 LANGUAGES = {
     "自动检测": ("auto", "auto"),
@@ -31,11 +33,16 @@ class Settings:
     qwen_path: str = "Qwen/Qwen3-ASR-0.6B"
     asr_url: str = "http://127.0.0.1:8000/v1"
     asr_model: str = "whisper-1"
-    provider: str = "qwen-mt"
+    provider: str = "embedded"
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     model: str = "qwen-mt-flash"
-    max_segment: float = 4.0
-    silence_ms: int = 550
+    local_model_path: str = DEFAULT_LOCAL_MODEL
+    local_device: str = "auto"
+    local_threads: int = 6
+    max_segment: float = 6.0
+    silence_ms: int = 320
+    live_preview: bool = True
+    preview_seconds: float = 1.2
     auto_gain: bool = True
     font_size: int = 28
     opacity: int = 72
@@ -61,6 +68,10 @@ class Settings:
             result.max_segment = max(2.0, min(10.0, float(result.max_segment)))
             result.silence_ms = max(200, min(2000, int(result.silence_ms)))
             result.overlay_width = max(500, min(1800, int(result.overlay_width)))
+            result.local_threads = max(1, min(32, int(result.local_threads)))
+            result.preview_seconds = max(0.8, min(3.0, float(result.preview_seconds)))
+            if result.local_device not in ("auto", "cpu", "gpu"):
+                result.local_device = "auto"
             return result
         except (OSError, ValueError, TypeError):
             return cls()

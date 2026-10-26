@@ -13,6 +13,11 @@ class Caption:
     source: str
     translation: str = ""
     status: str = "等待翻译"
+    revision: int = 0
+    final: bool = True
+    started_at: float = 0.0
+    ended_at: float = 0.0
+    asr_seconds: float = 0.0
 
 
 class History:

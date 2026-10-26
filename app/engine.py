@@ -55,6 +55,7 @@ class Engine(QObject):
 
     def _run(self):
         capture_thread = translation_thread = None
+        translator = recognizer = None
         translations = queue.Queue(maxsize=4)
         utterances = queue.Queue(maxsize=4)
         try:
@@ -71,6 +72,7 @@ class Engine(QObject):
                 recognizer = APIRecognizer(self.s, self.asr_key)
             else:
                 recognizer = WhisperRecognizer(self.s, self.status.emit)
+            translator.prepare(self.stop_event, self.status.emit)
             if self.stop_event.is_set():
                 return
             segmenter = Segmenter(SileroDetector(), self.s.max_segment, self.s.silence_ms, self.s.auto_gain)
@@ -120,6 +122,8 @@ class Engine(QObject):
                     if dropped is not None:
                         self.dropped += 1
                         self.caption.emit(replace(dropped, status="已跳过：翻译队列积压"))
+        except Cancelled:
+            pass
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
@@ -129,6 +133,13 @@ class Engine(QObject):
             # Provider reads time out, and streaming output checks cancellation.
             if translation_thread:
                 translation_thread.join()
+            for resource in (translator, recognizer):
+                close = getattr(resource, "close", None)
+                if close:
+                    try:
+                        close()
+                    except Exception:
+                        self.error.emit("模型资源释放失败，请关闭软件后重试。")
             self.finished.emit()
 
     def _translate(self, translator: Translator, pending: queue.Queue):
